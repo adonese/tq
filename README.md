@@ -33,11 +33,11 @@ import (
     "github.com/adonese/tq"
 )
 
-var taskQueue *taskqueue.TaskQueue
+var taskQueue *tq.TaskQueue
 
 func init() {
     logger := log.New(os.Stdout, "taskqueue: ", log.LstdFlags)
-    taskQueue = taskqueue.NewTaskQueue(10, 5, logger)
+    taskQueue = tq.NewTaskQueue(10, 5, logger)
 }
 ```
 
@@ -47,7 +47,7 @@ You can add tasks to the queue from anywhere in your application. Each task cons
 
 ```go
 func addTask() {
-    task := taskqueue.Task{
+    task := tq.Task{
         ID: "task-1",
         Job: func(ctx context.Context) error {
             // Your task logic here
@@ -62,7 +62,7 @@ func addTask() {
 
 ### Using with a Web Server
 
-Here is an example of using `TaskQueue` with the `Gin` web framework:
+Here is an example of using `tq` with the `Gin` web framework:
 
 ```go
 package main
@@ -76,16 +76,16 @@ import (
     "github.com/adonese/tq"
 )
 
-var taskQueue *taskqueue.TaskQueue
+var taskQueue *tq.TaskQueue
 
 func init() {
     logger := log.New(os.Stdout, "taskqueue: ", log.LstdFlags)
-    taskQueue = taskqueue.NewTaskQueue(10, 5, logger)
+    taskQueue = tq.NewTaskQueue(10, 5, logger)
 }
 
 func addSimpleTaskHandler(c *gin.Context) {
     taskID := c.Query("id")
-    task := taskqueue.Task{
+    task := tq.Task{
         ID: taskID,
         Job: func(ctx context.Context) error {
             log.Printf("Processing task %s", taskID)
@@ -93,7 +93,7 @@ func addSimpleTaskHandler(c *gin.Context) {
         },
         MaxRetries: 3,
     }
-    taskQueue.AddTask(task)
+    tq.AddTask(task)
     c.JSON(http.StatusOK, gin.H{"status": "task added"})
 }
 
@@ -101,7 +101,7 @@ func main() {
     r := gin.Default()
     r.GET("/add-task", addSimpleTaskHandler)
     r.Run(":8080")
-    defer taskQueue.Shutdown()
+    defer tq.Shutdown()
 }
 ```
 
@@ -112,7 +112,7 @@ You can also add tasks that perform HTTP requests or other complex operations:
 ```go
 func addHttpRequestTaskHandler(c *gin.Context) {
     taskID := c.Query("id")
-    task := taskqueue.Task{
+    task := tq.Task{
         ID: taskID,
         Job: func(ctx context.Context) error {
             cmd := exec.CommandContext(ctx, "curl", "-s", "https://example.com")
@@ -126,7 +126,7 @@ func addHttpRequestTaskHandler(c *gin.Context) {
         },
         MaxRetries: 3,
     }
-    taskQueue.AddTask(task)
+    tq.AddTask(task)
     c.JSON(http.StatusOK, gin.H{"status": "HTTP request task added"})
 }
 ```
@@ -142,7 +142,7 @@ func main() {
     r.GET("/add-http-task", addHttpRequestTaskHandler)
     r.Run(":8080")
 
-    defer taskQueue.Shutdown()
+    defer tq.Shutdown()
 }
 ```
 
