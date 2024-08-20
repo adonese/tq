@@ -6,582 +6,395 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/exp/rand"
 )
 
-func TestRetryTask(t *testing.T) {
+func TestTaskQueueWithContext(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq := NewTaskQueue(10, 5, logger, 100)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	var processedTasks int32
+	job := func(ctx context.Context) error {
+		atomic.AddInt32(&processedTasks, 1)
+		return nil
+	}
+
+	for i := 0; i < 5; i++ {
+		err := tq.AddTask(ctx, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 3})
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
+		}
+	}
+
+	results, err := tq.ProcessTasksAsync(ctx, nil)
+	if err != nil {
+		t.Errorf("Failed to process tasks: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		select {
+		case result := <-results:
+			if result.Error != nil {
+				t.Errorf("Task %s failed: %v", result.TaskID, result.Error)
+			}
+		case <-ctx.Done():
+			t.Errorf("Context deadline exceeded")
+		}
+	}
+
+	err = tq.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+
+	if atomic.LoadInt32(&processedTasks) != 5 {
+		t.Errorf("Expected 5 processed tasks, got %d", processedTasks)
+	}
+}
+
+func TestTaskPriority(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq := NewTaskQueue(10, 1, logger, 100)
+
 	ctx := context.Background()
 
-	// Test 1: Retry logic with a failing task
-	failCount := 0
-	maxRetries := 3
-	job := func(ctx context.Context) error {
-		failCount++
-		return errors.New("fail")
-	}
-
-	RetryTask(ctx, Task{ID: "1", Job: job, MaxRetries: maxRetries}, logger)
-	if failCount != maxRetries {
-		t.Errorf("expected %d retries, got %d", maxRetries, failCount)
-	}
-
-	// Test 2: Successful task after retries
-	successCount := 0
-	job = func(ctx context.Context) error {
-		successCount++
-		if successCount < 2 {
-			return errors.New("fail")
-		}
-		return nil
-	}
-
-	RetryTask(ctx, Task{ID: "2", Job: job, MaxRetries: maxRetries}, logger)
-	if successCount != 2 {
-		t.Errorf("expected success after 2 attempts, got %d", successCount)
-	}
-}
-
-func TestTaskQueue(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
+	var executionOrder []string
 	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
-	}
-
-	tq.AddTask(Task{ID: "1", Job: job, MaxRetries: 3})
-	tq.AddTask(Task{ID: "2", Job: job, MaxRetries: 3})
-	tq.AddTask(Task{ID: "3", Job: job, MaxRetries: 3})
-
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 3 {
-		t.Errorf("expected 3 processed tasks, got %d", processedTasks)
-	}
-}
-
-func TestRaceCondition(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		logger.Printf("Processed tasks count updated: %d", processedTasks)
-		return nil
-	}
-
-	tasks := []Task{
-		{ID: "1", Job: job, MaxRetries: 3},
-		{ID: "2", Job: job, MaxRetries: 3},
-		{ID: "3", Job: job, MaxRetries: 3},
-	}
-
-	logger.Println("Adding and processing tasks...")
-	tq.AddAndProcessTasks(tasks)
-
-	mu.Lock()
-	defer mu.Unlock()
-	logger.Printf("Final processed tasks count: %d", processedTasks)
-	if processedTasks != 3 {
-		t.Errorf("expected 3 processed tasks, got %d", processedTasks)
-	}
-}
-
-func TestNoDoubleTransactions(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	taskID := "unique-task-id"
-	job := func(ctx context.Context) error {
-		return nil
-	}
-
-	tq.AddTask(Task{ID: taskID, Job: job, MaxRetries: 3})
-	tq.AddTask(Task{ID: taskID, Job: job, MaxRetries: 3}) // Duplicate task
-
-	tq.Shutdown()
-
-	// If the task is processed more than once, the logger should have logged it
-	// You would need to check the logger output if you are logging the "skipping" message
-}
-
-func TestGracefulShutdownWithPendingTasks(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		time.Sleep(100 * time.Millisecond) // Simulate long-running task
-		return nil
-	}
-
-	tasks := []Task{
-		{ID: "1", Job: job, MaxRetries: 3},
-		{ID: "2", Job: job, MaxRetries: 3},
-		{ID: "3", Job: job, MaxRetries: 3},
-	}
-
-	go tq.AddAndProcessTasks(tasks)
-	time.Sleep(50 * time.Millisecond) // Let some tasks start processing
-
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 3 {
-		t.Errorf("expected 3 processed tasks, got %d", processedTasks)
-	}
-}
-
-func TestAllTasksProcessed(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks []string
-	var mu sync.Mutex
-
 	job := func(id string) func(ctx context.Context) error {
 		return func(ctx context.Context) error {
 			mu.Lock()
-			defer mu.Unlock()
-			processedTasks = append(processedTasks, id)
+			executionOrder = append(executionOrder, id)
+			mu.Unlock()
 			return nil
 		}
 	}
 
 	tasks := []Task{
-		{ID: "1", Job: job("1"), MaxRetries: 3},
-		{ID: "2", Job: job("2"), MaxRetries: 3},
-		{ID: "3", Job: job("3"), MaxRetries: 3},
+		{ID: "low", Job: job("low"), MaxRetries: 1, Priority: LowPriority},
+		{ID: "high", Job: job("high"), MaxRetries: 1, Priority: HighPriority},
+		{ID: "medium", Job: job("medium"), MaxRetries: 1, Priority: MediumPriority},
 	}
 
-	tq.AddAndProcessTasks(tasks)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	expectedTasks := []string{"1", "2", "3"}
-	taskMap := make(map[string]bool)
-	for _, id := range processedTasks {
-		taskMap[id] = true
-	}
-
-	for _, id := range expectedTasks {
-		if !taskMap[id] {
-			t.Errorf("expected task %s to be processed, but it was not", id)
+	for _, task := range tasks {
+		err := tq.AddTask(ctx, task)
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
 		}
 	}
-}
 
-func TestTaskFailureHandling(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	failCount := 0
-	maxRetries := 3
-	job := func(ctx context.Context) error {
-		failCount++
-		return errors.New("fail")
+	results, err := tq.ProcessTasksAsync(ctx, nil)
+	if err != nil {
+		t.Errorf("Failed to process tasks: %v", err)
 	}
 
-	tq.AddTask(Task{ID: "1", Job: job, MaxRetries: maxRetries})
-	tq.Shutdown()
+	for range tasks {
+		<-results
+	}
 
-	if failCount != maxRetries {
-		t.Errorf("expected %d retries, got %d", maxRetries, failCount)
+	err = tq.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+
+	expected := []string{"high", "medium", "low"}
+	if !reflect.DeepEqual(executionOrder, expected) {
+		t.Errorf("Expected execution order %v, got %v", expected, executionOrder)
 	}
 }
 
-func TestHighLoad(t *testing.T) {
+func TestRateLimiting(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 10, logger)
+	tq := NewTaskQueue(10, 1, logger, 10) // 10 tasks per second, single worker
 
-	var processedTasks int
-	var mu sync.Mutex
+	ctx := context.Background()
 
+	taskCount := 20
+	start := time.Now()
+
+	for i := 0; i < taskCount; i++ {
+		err := tq.AddTask(ctx, Task{
+			ID:         fmt.Sprintf("task-%d", i),
+			Job:        func(ctx context.Context) error { return nil },
+			MaxRetries: 1,
+		})
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
+		}
+	}
+
+	err := tq.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+
+	duration := time.Since(start)
+	expectedDuration := time.Duration(taskCount/10) * time.Second
+
+	if duration < expectedDuration {
+		t.Errorf("Tasks completed too quickly. Expected at least %v, got %v", expectedDuration, duration)
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq := NewTaskQueue(10, 5, logger, 100)
+
+	ctx := context.Background()
+
+	var processedTasks int32
 	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
+		time.Sleep(100 * time.Millisecond)
+		atomic.AddInt32(&processedTasks, 1)
 		return nil
 	}
 
-	var tasks []Task
-	for i := 0; i < 100; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("%d", i), Job: job, MaxRetries: 3})
+	for i := 0; i < 10; i++ {
+		err := tq.AddTask(ctx, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 1})
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
+		}
 	}
 
-	tq.AddAndProcessTasks(tasks)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 100 {
-		t.Errorf("expected 100 processed tasks, got %d", processedTasks)
-	}
-}
-
-func TestAddTaskAfterShutdown(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
+	err := tq.Shutdown(shutdownCtx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
 	}
 
-	tq.AddTask(Task{ID: "1", Job: job, MaxRetries: 3})
-	tq.Shutdown()
-
-	tq.AddTask(Task{ID: "2", Job: job, MaxRetries: 3}) // Should be rejected
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 1 {
-		t.Errorf("expected 1 processed task, got %d", processedTasks)
+	if atomic.LoadInt32(&processedTasks) != 10 {
+		t.Errorf("Expected 10 processed tasks, got %d", processedTasks)
 	}
 }
 
-func TestConcurrentAddTasks(t *testing.T) {
+func TestErrorHandling(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(30, 15, logger)
+	tq := NewTaskQueue(10, 5, logger, 100)
 
-	var processedTasks int
-	var mu sync.Mutex
+	ctx := context.Background()
 
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
+	errorJob := func(ctx context.Context) error {
+		return errors.New("task error")
 	}
+
+	err := tq.AddTask(ctx, Task{ID: "error-task", Job: errorJob, MaxRetries: 3})
+	if err != nil {
+		t.Errorf("Failed to add task: %v", err)
+	}
+
+	results, err := tq.ProcessTasksAsync(ctx, nil)
+	if err != nil {
+		t.Errorf("Failed to process tasks: %v", err)
+	}
+
+	result := <-results
+	if result.Error == nil {
+		t.Errorf("Expected error, got nil")
+	}
+
+	err = tq.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+}
+
+func TestTaskQueueStressTest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	logger := log.New(os.Stdout, "stress-test: ", log.LstdFlags)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	tq := NewTaskQueue(10000, 6000, logger, 5000) // 500 tasks/second, 50 workers
+
+	var (
+		totalTasks        int32 = 100000
+		completedTasks    int32
+		failedTasks       int32
+		highPriorityTasks int32
+		lowPriorityTasks  int32
+		addingTasks       int32 = 1
+	)
 
 	var wg sync.WaitGroup
-	numTasks := 100
-	wg.Add(numTasks)
 
-	for i := 0; i < numTasks; i++ {
-		go func(taskID string) {
-			defer wg.Done()
-			tq.AddTask(Task{ID: taskID, Job: job, MaxRetries: 3})
-		}(fmt.Sprintf("task-%d", i))
-	}
+	// Task generator
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer atomic.StoreInt32(&addingTasks, 0)
+		for i := int32(0); i < totalTasks; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
-	wg.Wait()
-	tq.Shutdown()
+			priority := LowPriority
+			if rand.Float32() < 0.1 { // 10% high priority tasks
+				priority = HighPriority
+				atomic.AddInt32(&highPriorityTasks, 1)
+			} else {
+				atomic.AddInt32(&lowPriorityTasks, 1)
+			}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != numTasks {
-		t.Errorf("expected %d processed tasks, got %d", numTasks, processedTasks)
-	}
-}
-
-func TestAddTasksConcurrently_AllTasksProcessed(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 10, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
-	}
-
-	var tasks []Task
-	numTasks := 100
-	for i := 0; i < numTasks; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 3})
-	}
-
-	tq.AddTasksConcurrently(tasks)
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != numTasks {
-		t.Errorf("expected %d processed tasks, got %d", numTasks, processedTasks)
-	}
-}
-
-func TestAddTasksConcurrently_WithFailures(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 80, logger)
-
-	var processedTasks int
-	var failedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		if processedTasks%2 == 0 { // Simulate failure for even tasks
-			failedTasks++
-			return errors.New("task failed")
-		}
-		return nil
-	}
-
-	var tasks []Task
-	numTasks := 50
-	for i := 0; i < numTasks; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 3})
-	}
-
-	tq.AddTasksConcurrently(tasks)
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != numTasks*2 {
-		t.Errorf("expected %d processed tasks (including retries), got %d", numTasks*2, processedTasks)
-	}
-	if failedTasks != numTasks/2 {
-		t.Errorf("expected %d failed tasks, got %d", numTasks/2, failedTasks)
-	}
-}
-
-func TestAddTasksConcurrently_ConcurrentAddAndShutdown(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 10, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
-	}
-
-	var tasks []Task
-	numTasks := 50
-	for i := 0; i < numTasks; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 3})
-	}
-
-	go tq.AddTasksConcurrently(tasks)
-
-	time.Sleep(50 * time.Millisecond) // Let some tasks start processing
-	go tq.Shutdown()
-
-	tq.Shutdown() // Ensure all tasks are processed before shutdown completes
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks == 0 {
-		t.Errorf("expected some processed tasks, got %d", processedTasks)
-	}
-}
-
-func TestAddTasksConcurrently_HTTPRequestTasks(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 10, logger)
-
-	var tasks []Task
-	numTasks := 10
-	for i := 0; i < numTasks; i++ {
-		taskID := fmt.Sprintf("http-task-%d", i)
-		task := Task{
-			ID: taskID,
-			Job: func(ctx context.Context) error {
-				// Task logic to make an HTTP request using curl
-				cmd := exec.CommandContext(ctx, "curl", "-s", "https://example.com")
-				output, err := cmd.Output()
-				if err != nil {
-					log.Printf("Task %s failed: %v", taskID, err)
-					return err
-				}
-				log.Printf("Task %s succeeded: %s", taskID, output)
-				return nil
-			},
-			MaxRetries: 3,
-		}
-		tasks = append(tasks, task)
-	}
-
-	tq.AddTasksConcurrently(tasks)
-	tq.Shutdown()
-}
-
-func TestAddTasksConcurrently_MixedTaskTypes(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(100, 50, logger)
-
-	var processedSimpleTasks int
-	var processedHttpTasks int
-	var mu sync.Mutex
-
-	simpleJob := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedSimpleTasks++
-		return nil
-	}
-
-	httpJob := func(ctx context.Context) error {
-		// Task logic to make an HTTP request using curl
-		cmd := exec.CommandContext(ctx, "curl", "-s", "https://example.com")
-		output, err := cmd.Output()
-		if err != nil {
-			log.Printf("HTTP task failed: %v", err)
-			return err
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		processedHttpTasks++
-		log.Printf("HTTP task succeeded: %s", output)
-		return nil
-	}
-
-	var tasks []Task
-	numSimpleTasks := 50
-	numHttpTasks := 10
-	for i := 0; i < numSimpleTasks; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("simple-task-%d", i), Job: simpleJob, MaxRetries: 3})
-	}
-	for i := 0; i < numHttpTasks; i++ {
-		tasks = append(tasks, Task{ID: fmt.Sprintf("http-task-%d", i), Job: httpJob, MaxRetries: 3})
-	}
-
-	tq.AddTasksConcurrently(tasks)
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedSimpleTasks != numSimpleTasks {
-		t.Errorf("expected %d processed simple tasks, got %d", numSimpleTasks, processedSimpleTasks)
-	}
-	if processedHttpTasks != numHttpTasks {
-		t.Errorf("expected %d processed HTTP tasks, got %d", numHttpTasks, processedHttpTasks)
-	}
-}
-
-func TestAddTask(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
-	}
-
-	task := Task{ID: "task-1", Job: job, MaxRetries: 3}
-	tq.AddTask(task)
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 1 {
-		t.Errorf("expected 1 processed task, got %d", processedTasks)
-	}
-}
-
-func TestAddHttpRequestTask(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		cmd := exec.CommandContext(ctx, "curl", "-s", "https://example.com")
-		output, err := cmd.Output()
-		if err != nil {
-			log.Printf("HTTP request task failed: %v", err)
-			return err
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		log.Printf("HTTP request task succeeded: %s", output)
-		return nil
-	}
-
-	task := Task{ID: "http-task-1", Job: job, MaxRetries: 3}
-	tq.AddTask(task)
-	tq.Shutdown()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != 1 {
-		t.Errorf("expected 1 processed task, got %d", processedTasks)
-	}
-}
-
-func TestHighConcurrencyAddTasks(t *testing.T) {
-	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(1000, 50, logger)
-
-	var processedTasks int
-	var mu sync.Mutex
-
-	job := func(ctx context.Context) error {
-		mu.Lock()
-		defer mu.Unlock()
-		processedTasks++
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	numHandlers := 1000
-	wg.Add(numHandlers)
-
-	for i := 0; i < numHandlers; i++ {
-		go func(handlerID int) {
-			defer wg.Done()
-			taskID := fmt.Sprintf("task-%d", handlerID)
 			task := Task{
-				ID:         taskID,
-				Job:        job,
+				ID:       fmt.Sprintf("task-%d", i),
+				Priority: priority,
+				Job: func(ctx context.Context) error {
+					if rand.Float32() < 0.01 { // 1% chance of failure
+						return fmt.Errorf("random task failure")
+					}
+					time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
+					return nil
+				},
 				MaxRetries: 3,
 			}
-			tq.AddTask(task)
-		}(i)
+
+			err := tq.AddTask(ctx, task)
+			if err != nil {
+				logger.Printf("Failed to add task: %v", err)
+				return
+			}
+
+			if i%1000 == 0 {
+				logger.Printf("Added %d tasks", i)
+			}
+		}
+	}()
+
+	// Result processor
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for result := range tq.results {
+			if result.Error != nil {
+				atomic.AddInt32(&failedTasks, 1)
+			} else {
+				atomic.AddInt32(&completedTasks, 1)
+			}
+
+			if (atomic.LoadInt32(&completedTasks)+atomic.LoadInt32(&failedTasks))%1000 == 0 {
+				logger.Printf("Processed %d tasks", atomic.LoadInt32(&completedTasks)+atomic.LoadInt32(&failedTasks))
+			}
+		}
+	}()
+
+	// Simulate periodic high load
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if atomic.LoadInt32(&addingTasks) == 0 {
+					return
+				}
+				burstSize := int32(5000)
+				logger.Printf("Adding burst of %d high priority tasks", burstSize)
+				for i := int32(0); i < burstSize; i++ {
+					task := Task{
+						ID:         fmt.Sprintf("burst-task-%d", i),
+						Priority:   HighPriority,
+						Job:        func(ctx context.Context) error { return nil },
+						MaxRetries: 1,
+					}
+					err := tq.AddTask(ctx, task)
+					if err != nil {
+						logger.Printf("Failed to add burst task: %v", err)
+						return
+					}
+				}
+				atomic.AddInt32(&totalTasks, burstSize)
+				atomic.AddInt32(&highPriorityTasks, burstSize)
+			}
+		}
+	}()
+
+	// Monitor goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				completed := atomic.LoadInt32(&completedTasks)
+				failed := atomic.LoadInt32(&failedTasks)
+				total := atomic.LoadInt32(&totalTasks)
+				logger.Printf("Progress: %d/%d (%.2f%%) completed, %d failed",
+					completed, total, float64(completed)/float64(total)*100, failed)
+			}
+		}
+	}()
+
+	// Wait for all tasks to be processed or timeout
+	for {
+		select {
+		case <-ctx.Done():
+			t.Logf("Test timed out")
+			goto Shutdown
+		default:
+			if atomic.LoadInt32(&completedTasks)+atomic.LoadInt32(&failedTasks) >= atomic.LoadInt32(&totalTasks) &&
+				atomic.LoadInt32(&addingTasks) == 0 {
+				goto Shutdown
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
-	wg.Wait()
-	tq.Shutdown()
+Shutdown:
+	logger.Println("Initiating shutdown")
+	err := tq.Shutdown(context.Background())
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if processedTasks != numHandlers {
-		t.Errorf("expected %d processed tasks, got %d", numHandlers, processedTasks)
+	logger.Println("Waiting for all goroutines to finish")
+	wg.Wait()
+
+	// Final statistics
+	completed := atomic.LoadInt32(&completedTasks)
+	failed := atomic.LoadInt32(&failedTasks)
+	total := atomic.LoadInt32(&totalTasks)
+	highPriority := atomic.LoadInt32(&highPriorityTasks)
+	lowPriority := atomic.LoadInt32(&lowPriorityTasks)
+
+	logger.Printf("Test completed. Total tasks: %d, Completed: %d, Failed: %d", total, completed, failed)
+	logger.Printf("High priority tasks: %d, Low priority tasks: %d", highPriority, lowPriority)
+
+	// Assertions
+	if completed+failed != total {
+		t.Errorf("Task count mismatch. Total: %d, Completed + Failed: %d", total, completed+failed)
+	}
+
+	failureRate := float64(failed) / float64(total)
+	if failureRate > 0.02 { // Allow for slightly higher failure rate due to retries
+		t.Errorf("Failure rate too high: %.2f%%", failureRate*100)
+	}
+
+	if float64(completed)/float64(lowPriority) <= float64(completed)/float64(highPriority) {
+		t.Errorf("Priority processing not working as expected")
 	}
 }
