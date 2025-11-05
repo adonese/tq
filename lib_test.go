@@ -17,7 +17,10 @@ import (
 
 func TestTaskQueueWithContext(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger, 100)
+	tq, err := NewTaskQueueSimple(10, 5, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -29,16 +32,20 @@ func TestTaskQueueWithContext(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		err := tq.AddTask(ctx, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 3})
+		err := tq.AddTask(ctx, Task{
+			ID:  fmt.Sprintf("task-%d", i),
+			Job: job,
+			Retry: &RetryConfig{
+				MaxRetries:      3,
+				BackoffStrategy: ExponentialBackoff,
+			},
+		})
 		if err != nil {
 			t.Errorf("Failed to add task: %v", err)
 		}
 	}
 
-	results, err := tq.ProcessTasksAsync(ctx, nil)
-	if err != nil {
-		t.Errorf("Failed to process tasks: %v", err)
-	}
+	results := tq.Results()
 
 	for i := 0; i < 5; i++ {
 		select {
@@ -63,7 +70,10 @@ func TestTaskQueueWithContext(t *testing.T) {
 
 func TestTaskPriority(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 1, logger, 100)
+	tq, err := NewTaskQueueSimple(10, 1, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -79,9 +89,9 @@ func TestTaskPriority(t *testing.T) {
 	}
 
 	tasks := []Task{
-		{ID: "low", Job: job("low"), MaxRetries: 1, Priority: LowPriority},
-		{ID: "high", Job: job("high"), MaxRetries: 1, Priority: HighPriority},
-		{ID: "medium", Job: job("medium"), MaxRetries: 1, Priority: MediumPriority},
+		{ID: "low", Job: job("low"), Priority: LowPriority},
+		{ID: "high", Job: job("high"), Priority: HighPriority},
+		{ID: "medium", Job: job("medium"), Priority: MediumPriority},
 	}
 
 	for _, task := range tasks {
@@ -91,10 +101,7 @@ func TestTaskPriority(t *testing.T) {
 		}
 	}
 
-	results, err := tq.ProcessTasksAsync(ctx, nil)
-	if err != nil {
-		t.Errorf("Failed to process tasks: %v", err)
-	}
+	results := tq.Results()
 
 	for range tasks {
 		<-results
@@ -113,7 +120,10 @@ func TestTaskPriority(t *testing.T) {
 
 func TestRateLimiting(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 1, logger, 10) // 10 tasks per second, single worker
+	tq, err := NewTaskQueueSimple(10, 1, logger, 10) // 10 tasks per second, single worker
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -122,16 +132,15 @@ func TestRateLimiting(t *testing.T) {
 
 	for i := 0; i < taskCount; i++ {
 		err := tq.AddTask(ctx, Task{
-			ID:         fmt.Sprintf("task-%d", i),
-			Job:        func(ctx context.Context) error { return nil },
-			MaxRetries: 1,
+			ID:  fmt.Sprintf("task-%d", i),
+			Job: func(ctx context.Context) error { return nil },
 		})
 		if err != nil {
 			t.Errorf("Failed to add task: %v", err)
 		}
 	}
 
-	err := tq.Shutdown(ctx)
+	err = tq.Shutdown(ctx)
 	if err != nil {
 		t.Errorf("Failed to shutdown: %v", err)
 	}
@@ -146,7 +155,10 @@ func TestRateLimiting(t *testing.T) {
 
 func TestGracefulShutdown(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger, 100)
+	tq, err := NewTaskQueueSimple(10, 5, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -158,7 +170,7 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		err := tq.AddTask(ctx, Task{ID: fmt.Sprintf("task-%d", i), Job: job, MaxRetries: 1})
+		err := tq.AddTask(ctx, Task{ID: fmt.Sprintf("task-%d", i), Job: job})
 		if err != nil {
 			t.Errorf("Failed to add task: %v", err)
 		}
@@ -167,7 +179,7 @@ func TestGracefulShutdown(t *testing.T) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := tq.Shutdown(shutdownCtx)
+	err = tq.Shutdown(shutdownCtx)
 	if err != nil {
 		t.Errorf("Failed to shutdown: %v", err)
 	}
@@ -179,7 +191,10 @@ func TestGracefulShutdown(t *testing.T) {
 
 func TestErrorHandling(t *testing.T) {
 	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
-	tq := NewTaskQueue(10, 5, logger, 100)
+	tq, err := NewTaskQueueSimple(10, 5, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -187,15 +202,19 @@ func TestErrorHandling(t *testing.T) {
 		return errors.New("task error")
 	}
 
-	err := tq.AddTask(ctx, Task{ID: "error-task", Job: errorJob, MaxRetries: 3})
+	err = tq.AddTask(ctx, Task{
+		ID:  "error-task",
+		Job: errorJob,
+		Retry: &RetryConfig{
+			MaxRetries:      3,
+			BackoffStrategy: ExponentialBackoff,
+		},
+	})
 	if err != nil {
 		t.Errorf("Failed to add task: %v", err)
 	}
 
-	results, err := tq.ProcessTasksAsync(ctx, nil)
-	if err != nil {
-		t.Errorf("Failed to process tasks: %v", err)
-	}
+	results := tq.Results()
 
 	result := <-results
 	if result.Error == nil {
@@ -217,7 +236,10 @@ func TestTaskQueueStressTest(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	tq := NewTaskQueue(10000, 6000, logger, 5000) // 500 tasks/second, 50 workers
+	tq, err := NewTaskQueueSimple(10000, 6000, logger, 5000) // 5000 tasks/second, 6000 workers
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
 
 	var (
 		totalTasks        int32 = 100000
@@ -260,7 +282,10 @@ func TestTaskQueueStressTest(t *testing.T) {
 					time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 					return nil
 				},
-				MaxRetries: 3,
+				Retry: &RetryConfig{
+					MaxRetries:      3,
+					BackoffStrategy: ExponentialBackoff,
+				},
 			}
 
 			err := tq.AddTask(ctx, task)
@@ -279,7 +304,7 @@ func TestTaskQueueStressTest(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for result := range tq.results {
+		for result := range tq.Results() {
 			if result.Error != nil {
 				atomic.AddInt32(&failedTasks, 1)
 			} else {
@@ -311,10 +336,9 @@ func TestTaskQueueStressTest(t *testing.T) {
 				logger.Printf("Adding burst of %d high priority tasks", burstSize)
 				for i := int32(0); i < burstSize; i++ {
 					task := Task{
-						ID:         fmt.Sprintf("burst-task-%d", i),
-						Priority:   HighPriority,
-						Job:        func(ctx context.Context) error { return nil },
-						MaxRetries: 1,
+						ID:       fmt.Sprintf("burst-task-%d", i),
+						Priority: HighPriority,
+						Job:      func(ctx context.Context) error { return nil },
 					}
 					err := tq.AddTask(ctx, task)
 					if err != nil {
@@ -366,7 +390,7 @@ func TestTaskQueueStressTest(t *testing.T) {
 
 Shutdown:
 	logger.Println("Initiating shutdown")
-	err := tq.Shutdown(context.Background())
+	err = tq.Shutdown(context.Background())
 	if err != nil {
 		t.Errorf("Failed to shutdown: %v", err)
 	}
@@ -397,4 +421,416 @@ Shutdown:
 	if float64(completed)/float64(lowPriority) <= float64(completed)/float64(highPriority) {
 		t.Errorf("Priority processing not working as expected")
 	}
+}
+
+// Test task cancellation
+func TestTaskCancellation(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq, err := NewTaskQueueSimple(10, 2, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx := context.Background()
+
+	var startedTasks int32
+	var completedTasks int32
+
+	job := func(ctx context.Context) error {
+		atomic.AddInt32(&startedTasks, 1)
+		time.Sleep(500 * time.Millisecond)
+		atomic.AddInt32(&completedTasks, 1)
+		return nil
+	}
+
+	// Add tasks
+	for i := 0; i < 5; i++ {
+		err := tq.AddTask(ctx, Task{
+			ID:  fmt.Sprintf("task-%d", i),
+			Job: job,
+		})
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
+		}
+	}
+
+	// Cancel one task
+	time.Sleep(100 * time.Millisecond)
+	err = tq.CancelTask("task-4")
+	if err != nil {
+		t.Logf("Task cancellation: %v", err)
+	}
+
+	err = tq.Shutdown(context.Background())
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+
+	t.Logf("Started: %d, Completed: %d", atomic.LoadInt32(&startedTasks), atomic.LoadInt32(&completedTasks))
+}
+
+// Test duplicate detection
+func TestDuplicateDetection(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq, err := NewTaskQueue(TaskQueueConfig{
+		BufferSize:        10,
+		WorkerCount:       2,
+		MaxRatePerSecond:  100,
+		AllowDuplicates:   false, // Disable duplicates
+		FullQueueStrategy: BlockUntilSpace,
+		Logger:            logger,
+		TaskTimeout:       5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx := context.Background()
+
+	job := func(ctx context.Context) error {
+		return nil
+	}
+
+	// Add first task
+	err = tq.AddTask(ctx, Task{ID: "duplicate-task", Job: job})
+	if err != nil {
+		t.Errorf("Failed to add first task: %v", err)
+	}
+
+	// Try to add duplicate - should fail
+	err = tq.AddTask(ctx, Task{ID: "duplicate-task", Job: job})
+	if !errors.Is(err, ErrDuplicateTask) {
+		t.Errorf("Expected ErrDuplicateTask, got: %v", err)
+	}
+
+	err = tq.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+}
+
+// Test full queue strategies
+func TestFullQueueStrategies(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+
+	t.Run("ReturnError", func(t *testing.T) {
+		tq, err := NewTaskQueue(TaskQueueConfig{
+			BufferSize:        2,
+			WorkerCount:       1,
+			MaxRatePerSecond:  1,
+			AllowDuplicates:   true,
+			FullQueueStrategy: ReturnError,
+			Logger:            logger,
+			TaskTimeout:       5 * time.Minute,
+		})
+		if err != nil {
+			t.Fatalf("Failed to create task queue: %v", err)
+		}
+
+		ctx := context.Background()
+		slowJob := func(ctx context.Context) error {
+			time.Sleep(2 * time.Second)
+			return nil
+		}
+
+		// Fill the queue
+		for i := 0; i < 3; i++ {
+			err := tq.AddTask(ctx, Task{
+				ID:  fmt.Sprintf("task-%d", i),
+				Job: slowJob,
+			})
+			if i < 2 && err != nil {
+				t.Errorf("Failed to add task %d: %v", i, err)
+			}
+		}
+
+		// This should fail with queue full
+		err = tq.AddTask(ctx, Task{ID: "overflow", Job: slowJob})
+		if !errors.Is(err, ErrQueueFull) {
+			t.Errorf("Expected ErrQueueFull, got: %v", err)
+		}
+
+		tq.Shutdown(context.Background())
+	})
+}
+
+// Test observability hooks
+func TestObservabilityHooks(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+
+	var startedCount, completedCount, failedCount, retryCount int32
+
+	hooks := &TaskQueueHooks{
+		OnTaskStarted: func(taskID string) {
+			atomic.AddInt32(&startedCount, 1)
+		},
+		OnTaskCompleted: func(taskID string, duration time.Duration) {
+			atomic.AddInt32(&completedCount, 1)
+		},
+		OnTaskFailed: func(taskID string, err error, retries int) {
+			atomic.AddInt32(&failedCount, 1)
+		},
+		OnTaskRetry: func(taskID string, attempt int, err error) {
+			atomic.AddInt32(&retryCount, 1)
+		},
+	}
+
+	tq, err := NewTaskQueue(TaskQueueConfig{
+		BufferSize:        10,
+		WorkerCount:       2,
+		MaxRatePerSecond:  100,
+		AllowDuplicates:   true,
+		FullQueueStrategy: BlockUntilSpace,
+		Hooks:             hooks,
+		Logger:            logger,
+		TaskTimeout:       5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Add successful task
+	err = tq.AddTask(ctx, Task{
+		ID:  "success",
+		Job: func(ctx context.Context) error { return nil },
+	})
+	if err != nil {
+		t.Errorf("Failed to add task: %v", err)
+	}
+
+	// Add failing task with retries
+	err = tq.AddTask(ctx, Task{
+		ID: "fail",
+		Job: func(ctx context.Context) error {
+			return errors.New("intentional failure")
+		},
+		Retry: &RetryConfig{
+			MaxRetries:      3,
+			BackoffStrategy: ConstantBackoff,
+			BaseDelay:       10 * time.Millisecond,
+		},
+	})
+	if err != nil {
+		t.Errorf("Failed to add task: %v", err)
+	}
+
+	err = tq.Shutdown(context.Background())
+	if err != nil {
+		t.Errorf("Failed to shutdown: %v", err)
+	}
+
+	if atomic.LoadInt32(&startedCount) != 2 {
+		t.Errorf("Expected 2 started tasks, got %d", startedCount)
+	}
+	if atomic.LoadInt32(&completedCount) != 1 {
+		t.Errorf("Expected 1 completed task, got %d", completedCount)
+	}
+	if atomic.LoadInt32(&failedCount) != 1 {
+		t.Errorf("Expected 1 failed task, got %d", failedCount)
+	}
+	if atomic.LoadInt32(&retryCount) < 2 {
+		t.Errorf("Expected at least 2 retries, got %d", retryCount)
+	}
+}
+
+// Test different backoff strategies
+func TestBackoffStrategies(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+
+	testCases := []struct {
+		name     string
+		strategy BackoffStrategy
+	}{
+		{"Exponential", ExponentialBackoff},
+		{"Linear", LinearBackoff},
+		{"Constant", ConstantBackoff},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tq, err := NewTaskQueueSimple(10, 2, logger, 100)
+			if err != nil {
+				t.Fatalf("Failed to create task queue: %v", err)
+			}
+
+			ctx := context.Background()
+			attempts := 0
+
+			err = tq.AddTask(ctx, Task{
+				ID: "retry-task",
+				Job: func(ctx context.Context) error {
+					attempts++
+					if attempts < 3 {
+						return errors.New("retry me")
+					}
+					return nil
+				},
+				Retry: &RetryConfig{
+					MaxRetries:      5,
+					BackoffStrategy: tc.strategy,
+					BaseDelay:       10 * time.Millisecond,
+				},
+			})
+			if err != nil {
+				t.Errorf("Failed to add task: %v", err)
+			}
+
+			err = tq.Shutdown(context.Background())
+			if err != nil {
+				t.Errorf("Failed to shutdown: %v", err)
+			}
+
+			if attempts < 3 {
+				t.Errorf("Task didn't retry enough times: %d", attempts)
+			}
+		})
+	}
+}
+
+// Test context cancellation during execution
+func TestContextCancellation(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq, err := NewTaskQueueSimple(10, 2, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	job := func(ctx context.Context) error {
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+
+	err = tq.AddTask(ctx, Task{ID: "slow-task", Job: job})
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Expected context deadline exceeded, got: %v", err)
+	}
+
+	tq.Shutdown(context.Background())
+}
+
+// Test input validation
+func TestInputValidation(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+
+	testCases := []struct {
+		name   string
+		config TaskQueueConfig
+	}{
+		{
+			name: "Zero buffer size",
+			config: TaskQueueConfig{
+				BufferSize:       0,
+				WorkerCount:      2,
+				MaxRatePerSecond: 100,
+			},
+		},
+		{
+			name: "Zero worker count",
+			config: TaskQueueConfig{
+				BufferSize:       10,
+				WorkerCount:      0,
+				MaxRatePerSecond: 100,
+			},
+		},
+		{
+			name: "Zero rate",
+			config: TaskQueueConfig{
+				BufferSize:       10,
+				WorkerCount:      2,
+				MaxRatePerSecond: 0,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.config.Logger = logger
+			_, err := NewTaskQueue(tc.config)
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Errorf("Expected ErrInvalidConfig, got: %v", err)
+			}
+		})
+	}
+}
+
+// Test GetQueueLength and IsProcessed
+func TestQueueInspection(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq, err := NewTaskQueueSimple(10, 1, logger, 10)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Add a slow task
+	tq.AddTask(ctx, Task{
+		ID: "slow",
+		Job: func(ctx context.Context) error {
+			time.Sleep(500 * time.Millisecond)
+			return nil
+		},
+	})
+
+	// Add more tasks
+	for i := 0; i < 3; i++ {
+		tq.AddTask(ctx, Task{
+			ID:  fmt.Sprintf("task-%d", i),
+			Job: func(ctx context.Context) error { return nil },
+		})
+	}
+
+	// Check queue length
+	queueLen := tq.GetQueueLength()
+	t.Logf("Queue length: %d", queueLen)
+
+	// Wait for tasks to complete
+	time.Sleep(1 * time.Second)
+
+	// Check if task is processed
+	if !tq.IsProcessed("slow") {
+		t.Error("Task 'slow' should be processed")
+	}
+
+	tq.Shutdown(context.Background())
+}
+
+// Test DrainResults
+func TestDrainResults(t *testing.T) {
+	logger := log.New(os.Stdout, "test: ", log.LstdFlags)
+	tq, err := NewTaskQueueSimple(10, 2, logger, 100)
+	if err != nil {
+		t.Fatalf("Failed to create task queue: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Add tasks
+	for i := 0; i < 5; i++ {
+		err := tq.AddTask(ctx, Task{
+			ID:  fmt.Sprintf("task-%d", i),
+			Job: func(ctx context.Context) error { return nil },
+		})
+		if err != nil {
+			t.Errorf("Failed to add task: %v", err)
+		}
+	}
+
+	// Wait a bit for tasks to complete
+	time.Sleep(200 * time.Millisecond)
+
+	// Drain results
+	results := tq.DrainResults()
+	t.Logf("Drained %d results", len(results))
+
+	if len(results) == 0 {
+		t.Error("Expected some results to be drained")
+	}
+
+	tq.Shutdown(context.Background())
 }
