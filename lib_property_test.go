@@ -2,12 +2,15 @@ package tq
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/adonese/tq"
 )
 
 // Property-based testing: Properties that should ALWAYS hold
